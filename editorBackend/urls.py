@@ -24,5 +24,8 @@ from editorBackend import settings
 urlpatterns = [
                   path('admin/', admin.site.urls),
                   path('api/', include('func.urls')),
+                  path('api/', include('account.urls')),
+                  path('api/', include('webpage.urls')),
+                  path('api/', include('export.urls')),
 
               ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
