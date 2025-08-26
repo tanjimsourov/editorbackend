@@ -8,11 +8,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # ---- System deps ----
-# unixODBC + headers for pyodbc; ffmpeg for imageio_ffmpeg; curl/gnupg for MS repo
+# unixODBC (+dev) for pyodbc, ffmpeg for imageio_ffmpeg, poppler-utils for pdf2image,
+# curl/gnupg/ca-certs to add Microsoft's repo for msodbcsql18
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     unixodbc unixodbc-dev \
     ffmpeg \
+    poppler-utils \
     curl gnupg ca-certificates apt-transport-https \
  && rm -rf /var/lib/apt/lists/*
 
@@ -30,7 +32,8 @@ RUN test -e /usr/lib/x86_64-linux-gnu/libodbc.so.2 || \
 # ---- Python deps ----
 COPY requirements.txt /app/
 RUN python -m pip install --upgrade pip \
- && pip install -r requirements.txt
+ && pip install -r requirements.txt \
+ && pip install --no-cache-dir gunicorn  # ensure gunicorn is present even if not in requirements.txt
 
 # ---- App code ----
 COPY . /app/
@@ -45,5 +48,5 @@ EXPOSE 8003
 CMD bash -lc "\
   python manage.py migrate --noinput && \
   python manage.py collectstatic --noinput && \
-  gunicorn editorBackend.wsgi:application --bind 0.0.0.0:8003 --workers 3 --timeout 120 \
+  python -m gunicorn editorBackend.wsgi:application --bind 0.0.0.0:8003 --workers 3 --timeout 120 \
 "
