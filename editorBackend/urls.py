@@ -1,3 +1,4 @@
+# editorBackend/urls.py
 """
 URL configuration for editorBackend project.
 
@@ -15,17 +16,20 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 
-from django.conf.urls.static import static
 from django.contrib import admin
-from django.urls import path, include
-
-from editorBackend import settings
+from django.urls import path, include, re_path
+from django.conf import settings
+from django.views.static import serve as media_serve
 
 urlpatterns = [
-                  path('admin/', admin.site.urls),
-                  path('api/', include('func.urls')),
-                  path('api/', include('account.urls')),
-                  path('api/', include('webpage.urls')),
-                  path('api/', include('export.urls')),
+    path('admin/', admin.site.urls),
+    path('api/', include('func.urls')),
+    path('api/', include('account.urls')),
+    path('api/', include('webpage.urls')),
+    path('api/', include('export.urls')),
+]
 
-              ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Serve MEDIA files at /media/... even when DEBUG=False
+urlpatterns += [
+    re_path(r'^media/(?P<path>.*)$', media_serve, {'document_root': settings.MEDIA_ROOT}),
+]
