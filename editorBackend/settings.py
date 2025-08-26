@@ -81,6 +81,17 @@ CLOUDINARY = {
 #     }
 # }
 
+
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME':"postgres",
+#         'USER': "postgres",
+#         'PASSWORD': "oQczjCziRxfMikUuQyjIIGzIoNX0xCDvMPJ0RIqGgsTwNC466YnogF6oxtbA2h1r",
+#         'HOST': "147.93.86.127",
+#         'PORT': "5436",
+#     }
+# }
 DATABASES = {
     "default": {
         "ENGINE": "mssql",
@@ -90,7 +101,7 @@ DATABASES = {
         "PASSWORD": "EQ#f4u7-8@)4",
         "OPTIONS": {
             "driver": "ODBC Driver 18 for SQL Server",
-
+            "extra_params": "TrustServerCertificate=yes;"
         },
     }
 }
