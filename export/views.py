@@ -2,10 +2,10 @@
 import os
 import shutil
 import subprocess
+from typing import Optional
 
 from django.conf import settings
 from django.utils.timezone import now
-from django.http import JsonResponse
 
 from rest_framework.views import APIView
 from rest_framework.generics import GenericAPIView
@@ -17,6 +17,11 @@ from rest_framework.permissions import IsAuthenticated
 from .models import LockedContent
 
 LOCKED_DIR = "locked"  # subfolder in MEDIA_ROOT
+
+# If True, when a non-MP4 upload is received and ffmpeg/transcode fails,
+# we keep the original WEBM and still return 200 with a warning.
+# If False, we return 500 on transcode failure.
+ALLOW_WEBM_FALLBACK = True
 
 
 # ---------- helpers ----------
@@ -34,14 +39,18 @@ def _rel_locked_path(filename: str) -> str:
 
 
 def _abs_media_url(request, rel_path: str) -> str:
-    base = settings.MEDIA_URL or "/media/"
+    base = getattr(settings, "MEDIA_URL", "/media/")
     if not base.endswith("/"):
         base += "/"
+    # rel_path like "locked/41.mp4"
     return request.build_absolute_uri(base + rel_path)
 
 
-def _ffmpeg_bin() -> str | None:
-    # Prefer settings.FFMPEG_BIN, then env FFMPEG_PATH, then "ffmpeg" in PATH
+def _ffmpeg_bin() -> Optional[str]:
+    """
+    Prefer settings.FFMPEG_BIN, then env FFMPEG_PATH, then 'ffmpeg' in PATH.
+    Return None if not found.
+    """
     cand = getattr(settings, "FFMPEG_BIN", None) or os.environ.get("FFMPEG_PATH") or "ffmpeg"
     if os.path.isabs(cand):
         return cand if os.path.exists(cand) else None
@@ -78,7 +87,7 @@ class LockedCreateView(APIView):
             status="locked",
         )
         return Response({
-            "id": lc.id,  # int (AutoField)
+            "id": lc.id,
             "name": lc.name,
             "type": lc.type,
             "duration_seconds": lc.duration_seconds,
@@ -155,8 +164,15 @@ class LockedSaveImageView(GenericAPIView):
 class LockedSaveVideoView(GenericAPIView):
     """
     POST /api/locked/<int:locked_id>/save-video
-    multipart/form-data: file=<WEBM or MP4>
-    - If not MP4, transcodes to MP4 using ffmpeg binary (settings.FFMPEG_BIN or PATH)
+    multipart/form-data: file=<WEBM or MP4 or other container>
+    Behavior:
+      1) Persist the ORIGINAL upload immediately to MEDIA_ROOT/locked/<id>.<ext> and update the model,
+         so DB never stays null when the request is valid.
+      2) If not MP4, attempt to transcode to MP4 with ffmpeg.
+         - On success: swap file to <id>.mp4 and delete original.
+         - On failure or missing ffmpeg:
+             * If ALLOW_WEBM_FALLBACK: keep original and return 200 with a 'warning'.
+             * Else: return 500.
     """
     parser_classes = [MultiPartParser]
     permission_classes = [IsAuthenticated]
@@ -176,58 +192,102 @@ class LockedSaveVideoView(GenericAPIView):
         if not (ctype.startswith("video/") or ctype in ("application/octet-stream", "")):
             return Response({"error": f"unexpected content_type: {ctype}"}, status=400)
 
-        ffmpeg = _ffmpeg_bin()
-        if not ffmpeg:
-            return Response({"error": "ffmpeg not found. Configure settings.FFMPEG_BIN or PATH."}, status=500)
-
         try:
             media_root = _ensure_media_root()
             out_dir = os.path.join(media_root, LOCKED_DIR)
             os.makedirs(out_dir, exist_ok=True)
 
-            uploaded_tmp = os.path.join(out_dir, f"{locked_id}.upload")
-            with open(uploaded_tmp, "wb") as out:
+            # Decide incoming extension based on filename or content-type
+            incoming_name = getattr(f, "name", "") or ""
+            in_ext = os.path.splitext(incoming_name)[1].lower()
+            if in_ext not in (".mp4", ".webm", ".mov", ".mkv", ".avi"):
+                if ctype == "video/mp4":
+                    in_ext = ".mp4"
+                elif ctype == "video/webm" or not in_ext:
+                    in_ext = ".webm"
+                else:
+                    # Default to webm when unsure
+                    in_ext = ".webm"
+
+            is_mp4 = (in_ext == ".mp4" or ctype == "video/mp4")
+
+            # 1) Persist ORIGINAL upload immediately
+            orig_rel = _rel_locked_path(f"{locked_id}{in_ext}")
+            orig_abs = os.path.join(media_root, orig_rel)
+
+            with open(orig_abs, "wb") as out:
                 for chunk in f.chunks():
                     out.write(chunk)
 
-            incoming_name = getattr(f, "name", "") or ""
-            is_mp4 = incoming_name.lower().endswith(".mp4") or ctype == "video/mp4"
-            mp4_path = os.path.join(out_dir, f"{locked_id}.mp4")
-
-            if is_mp4:
-                # Trust the incoming MP4; move into place
-                os.replace(uploaded_tmp, mp4_path)
-            else:
-                # Treat as WEBM/other; transcode to MP4
-                webm_path = os.path.join(out_dir, f"{locked_id}.webm")
-                os.replace(uploaded_tmp, webm_path)
-
-                cmd = [
-                    ffmpeg, "-y",
-                    "-hide_banner", "-loglevel", "error",
-                    "-i", webm_path,
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                    "-preset", "fast", "-crf", "22",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    mp4_path,
-                ]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                if proc.returncode != 0:
-                    return Response({"error": "Transcode failed", "ffmpeg": proc.stderr}, status=500)
-                try:
-                    os.remove(webm_path)
-                except Exception:
-                    pass
-
-            rel_path = _rel_locked_path(f"{locked_id}.mp4")
-            lc.file.name = rel_path
-            lc.status = "saved"
+            # Reflect original in the model so DB isn't null anymore
+            lc.file.name = orig_rel
+            lc.status = "saved"  # Using "saved" once the binary is persisted; change to "locked" if you prefer
             lc.save(update_fields=["file", "status"])
 
-            return Response({"fileUrl": _abs_media_url(request, rel_path)}, status=200)
+            # If it's already mp4, done
+            if is_mp4:
+                return Response({"fileUrl": _abs_media_url(request, orig_rel)}, status=200)
+
+            # 2) Try to transcode to MP4
+            ffmpeg = _ffmpeg_bin()
+            if not ffmpeg:
+                if ALLOW_WEBM_FALLBACK:
+                    return Response({
+                        "fileUrl": _abs_media_url(request, orig_rel),
+                        "warning": "ffmpeg not found; kept original file.",
+                    }, status=200)
+                return Response({"error": "ffmpeg not found. Configure settings.FFMPEG_BIN or PATH."}, status=500)
+
+            mp4_rel = _rel_locked_path(f"{locked_id}.mp4")
+            mp4_abs = os.path.join(media_root, mp4_rel)
+
+            cmd = [
+                ffmpeg, "-y",
+                "-hide_banner", "-loglevel", "error",
+                "-i", orig_abs,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-preset", "fast", "-crf", "22",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                mp4_abs,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if proc.returncode != 0:
+                if ALLOW_WEBM_FALLBACK:
+                    return Response({
+                        "fileUrl": _abs_media_url(request, orig_rel),
+                        "warning": "Transcode failed; kept original file.",
+                        "ffmpeg": proc.stderr[:5000],
+                    }, status=200)
+                return Response({"error": "Transcode failed", "ffmpeg": proc.stderr}, status=500)
+
+            # Swap model to MP4 and remove original
+            try:
+                if os.path.exists(orig_abs) and orig_abs != mp4_abs:
+                    try:
+                        os.remove(orig_abs)
+                    except Exception:
+                        pass
+
+                lc.file.name = mp4_rel
+                lc.status = "saved"
+                lc.save(update_fields=["file", "status"])
+            except Exception as e:
+                # MP4 created but model update failed; still return mp4 URL for debugging
+                return Response({
+                    "error": f"Saved MP4 but failed to update model: {e}",
+                    "fileUrl": _abs_media_url(request, mp4_rel)
+                }, status=500)
+
+            return Response({"fileUrl": _abs_media_url(request, mp4_rel)}, status=200)
 
         except subprocess.TimeoutExpired:
+            if ALLOW_WEBM_FALLBACK:
+                # Keep original file (likely WEBM)
+                return Response({
+                    "fileUrl": _abs_media_url(request, lc.file.name),
+                    "warning": "Transcode timed out; kept original file."
+                }, status=200)
             return Response({"error": "Transcode timed out"}, status=500)
         except Exception as e:
             return Response({"error": f"Failed to save video: {e}"}, status=500)
