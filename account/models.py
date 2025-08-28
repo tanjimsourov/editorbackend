@@ -52,7 +52,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     email = models.CharField(
         _('email'),
-        max_length=25,
+        max_length=250,
         default='',
         null=True
     )
