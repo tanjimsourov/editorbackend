@@ -26,7 +26,9 @@ urlpatterns = [
     path('api/', include('func.urls')),
     path('api/', include('account.urls')),
     path('api/', include('webpage.urls')),
-    path('api/', include('export.urls')),
+    # path('api/', include('export.urls')),
+    path('api/', include('render.urls')),
+    path('api/', include('content.urls')),
 ]
 
 # Serve MEDIA files at /media/... even when DEBUG=False
