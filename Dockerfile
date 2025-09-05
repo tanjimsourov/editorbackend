@@ -8,10 +8,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # ---------- System deps (ffmpeg + fonts + useful libs) ----------
-# - ffmpeg: required for preview/export (H.264/AAC enabled on Debian 12 builds)
-# - fontconfig & fonts-dejavu: avoid ffmpeg "font not found" errors for drawtext
-# - poppler-utils: if you ever rasterize PDFs as assets
-# - curl/gnupg/ca-certificates: for optional MS ODBC install step
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       ffmpeg \
@@ -22,7 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # ---------- (Optional) Microsoft ODBC Driver 18 ----------
-# If you don't need SQL Server / pyodbc, you can skip this entire block
 ARG INSTALL_MSODBCSQL18=1
 RUN if [ "$INSTALL_MSODBCSQL18" = "1" ]; then \
       curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
@@ -33,20 +28,24 @@ RUN if [ "$INSTALL_MSODBCSQL18" = "1" ]; then \
       rm -rf /var/lib/apt/lists/* ; \
     fi
 
-# Safety net for libodbc soname (no-op if already present)
+# LibODBC soname safety net (no-op if .so.2 already exists)
 RUN test -e /usr/lib/x86_64-linux-gnu/libodbc.so.2 || \
     ln -s /usr/lib/x86_64-linux-gnu/libodbc.so /usr/lib/x86_64-linux-gnu/libodbc.so.2 || true
 
-# ---------- Runtime ENV for your Django config ----------
-# These match the vars your settings.py reads and what ffmpeg-based libs expect.
+# ---------- Runtime ENV ----------
 ENV FFMPEG_BIN=/usr/bin/ffmpeg \
     FFMPEG_PATH=/usr/bin/ffmpeg \
     IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg \
     MEDIA_ROOT=/app/media \
     MEDIA_URL=/media/
 
-# Prove ffmpeg exists at build time (good early failure if image changes)
+# Prove ffmpeg exists at build time (early failure if base image changes)
 RUN ffmpeg -hide_banner -version && which ffmpeg
+
+# ---------- Create non-root user & prepare writable paths ----------
+RUN useradd -m appuser && \
+    mkdir -p /var/www && chown -R appuser:appuser /var/www && \
+    mkdir -p /app && chown -R appuser:appuser /app
 
 # ---------- Python deps ----------
 COPY requirements.txt /app/
@@ -56,27 +55,41 @@ RUN python -m pip install --upgrade pip && \
 
 # ---------- App code ----------
 COPY . /app/
+RUN chown -R appuser:appuser /app
 
-# ---------- Security: run as a non-root user ----------
-RUN useradd -m appuser && \
-    mkdir -p /app/media && chown -R appuser:appuser /app
+# ---------- Drop privileges ----------
 USER appuser
 
-# Expose the port your Gunicorn will bind to
 EXPOSE 8003
 
 # ---------- Entrypoint / CMD ----------
-# - Ensure MEDIA_ROOT exists (idempotent)
-# - Run migrations safely
-# - Collect static into STATIC_ROOT (your settings point to /var/www/editorBackend/assets/)
-#   If that path is mounted by your platform, make sure it’s writeable; otherwise you can
-#   switch STATIC_ROOT to a project path or skip collectstatic in container and let nginx serve.
-CMD bash -lc "\
-  echo 'FFMPEG_BIN='${FFMPEG_BIN} && ffmpeg -hide_banner -version && \
-  echo 'Ensuring MEDIA_ROOT at: '${MEDIA_ROOT} && mkdir -p \"${MEDIA_ROOT}\" && \
-  python manage.py makemigrations --noinput || true && \
-  python manage.py migrate --noinput && \
-  # collectstatic is safe if STATIC_ROOT is writeable; comment out if nginx serves static directly
-  (python manage.py collectstatic --noinput || true) && \
+# What this does at runtime:
+# 1) Recreate MEDIA_ROOT every start (you said you removed /app/media).
+# 2) Detect the actual STATIC_ROOT from Django settings and mkdir -p it.
+# 3) Run migrations and collectstatic safely for Coolify.
+CMD bash -lc '\
+  set -euo pipefail; \
+  echo "Ensuring MEDIA_ROOT at: ${MEDIA_ROOT}"; \
+  mkdir -p "${MEDIA_ROOT}"; \
+  \
+  echo "Discovering STATIC_ROOT from Django settings..."; \
+  PY_STATIC_DIR=$(python - <<PY \
+import sys, pathlib; \
+from django.conf import settings; \
+print(pathlib.Path(getattr(settings, "STATIC_ROOT", "/var/www/static")).as_posix()) \
+PY
+  ); \
+  echo "STATIC_ROOT resolved to: ${PY_STATIC_DIR}"; \
+  # Make sure parent of STATIC_ROOT is writable (handles deep /var/www/... paths)
+  mkdir -p "${PY_STATIC_DIR}"; \
+  \
+  echo "Running Django migrations..."; \
+  python manage.py makemigrations --noinput || true; \
+  python manage.py migrate --noinput; \
+  \
+  echo "Collecting static files into: ${PY_STATIC_DIR}"; \
+  python manage.py collectstatic --noinput; \
+  \
+  echo "Starting Gunicorn..."; \
   python -m gunicorn editorBackend.wsgi:application --bind 0.0.0.0:8003 --workers 3 --timeout 120 \
-"
+'
