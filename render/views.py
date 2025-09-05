@@ -14,7 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 
 from .serializers import TimelineSerializer
 from .models import LockedContent
-from .ffmpegkit.builder import build_ffmpeg_cmd, build_ffmpeg_cmd_still  # <- NEW import
+from .ffmpegkit.builder import build_ffmpeg_cmd, build_ffmpeg_cmd_still  # speed-aware
 
 try:
     import requests
@@ -22,7 +22,7 @@ except ImportError:
     requests = None
 
 
-# ---- shared helpers (unchanged, trimmed to what we need) ----
+# ---- shared helpers ----
 
 def _normalize_src_to_abs_url(request, src: str) -> str:
     p = urlparse(src)
@@ -191,7 +191,7 @@ def _resolve_ffmpeg_bin() -> str | None:
     return shutil.which("ffmpeg")
 
 
-# --------------------------- VIDEO endpoints (unchanged) ---------------------------
+# --------------------------- VIDEO endpoints ---------------------------
 
 class PreviewRenderView(APIView):
     permission_classes = [IsAuthenticated]
@@ -214,7 +214,8 @@ class PreviewRenderView(APIView):
         output_path = os.path.join(out_dir, filename)
 
         try:
-            args = build_ffmpeg_cmd(data_local, output_path)
+            # FAST preview
+            args = build_ffmpeg_cmd(data_local, output_path, mode="preview")
         except Exception as e:
             return Response({"error": f"Failed to build ffmpeg graph: {e}"}, status=400)
 
@@ -223,7 +224,11 @@ class PreviewRenderView(APIView):
             return Response({"error": "ffmpeg not found. Configure FFMPEG_BIN or PATH."}, status=400)
 
         try:
-            subprocess.run([ffmpeg_bin, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            subprocess.run(
+                [ffmpeg_bin, *args],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=True
+            )
         except subprocess.CalledProcessError as e:
             return Response({"error": "ffmpeg failed", "stderr": e.stderr.decode("utf-8", errors="ignore")}, status=500)
 
@@ -247,7 +252,6 @@ class RenderSaveView(APIView):
         except Exception as e:
             return Response({"error": f"Failed to localize assets: {e}"}, status=400)
 
-        # Always treat this endpoint as VIDEO (as requested)
         try:
             duration = float(data.get("duration") or 0.0)
         except Exception:
@@ -271,13 +275,18 @@ class RenderSaveView(APIView):
             return Response({"error": "ffmpeg not found. Configure FFMPEG_BIN or PATH."}, status=400)
 
         try:
-            args = build_ffmpeg_cmd(data_local, output_abs)
+            # QUALITY final
+            args = build_ffmpeg_cmd(data_local, output_abs, mode="final")
         except Exception as e:
             lc.delete()
             return Response({"error": f"Failed to build ffmpeg graph: {e}"}, status=400)
 
         try:
-            subprocess.run([ffmpeg_bin, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            subprocess.run(
+                [ffmpeg_bin, *args],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=True
+            )
         except subprocess.CalledProcessError as e:
             lc.delete()
             return Response({"error": "ffmpeg failed", "stderr": e.stderr.decode("utf-8", errors="ignore")}, status=500)
@@ -298,13 +307,9 @@ class RenderSaveView(APIView):
         }, status=200)
 
 
-# --------------------------- NEW: IMAGE endpoints (use ffmpeg STILL) ---------------------------
+# --------------------------- IMAGE endpoints ---------------------------
 
 class ImagePreviewView(APIView):
-    """
-    POST /api/render/image/preview
-    Renders one frame (PNG) from the full graph.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -333,7 +338,11 @@ class ImagePreviewView(APIView):
             return Response({"error": "ffmpeg not found. Configure FFMPEG_BIN or PATH."}, status=400)
 
         try:
-            subprocess.run([ffmpeg_bin, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            subprocess.run(
+                [ffmpeg_bin, *args],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=True
+            )
         except subprocess.CalledProcessError as e:
             return Response({"error": "ffmpeg failed", "stderr": e.stderr.decode("utf-8", errors="ignore")}, status=500)
 
@@ -342,10 +351,6 @@ class ImagePreviewView(APIView):
 
 
 class ImageSaveView(APIView):
-    """
-    POST /api/render/image
-    Saves one PNG into LockedContent (type='image').
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -385,7 +390,11 @@ class ImageSaveView(APIView):
             return Response({"error": f"Failed to build still graph: {e}"}, status=400)
 
         try:
-            subprocess.run([ffmpeg_bin, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            subprocess.run(
+                [ffmpeg_bin, *args],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=True
+            )
         except subprocess.CalledProcessError as e:
             lc.delete()
             return Response({"error": "ffmpeg failed", "stderr": e.stderr.decode("utf-8", errors="ignore")}, status=500)
