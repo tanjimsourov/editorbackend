@@ -150,6 +150,9 @@ def _localize_timeline_assets(request, timeline: dict) -> dict:
     if tl.get("backgroundImage"):
         tl["backgroundImage"] = _to_local_path(request, tl["backgroundImage"])
 
+    # keep orientation untouched (if present)
+    # tl.get("orientation") may be used by your ffmpeg builder if needed
+
     new_tracks = []
     for tr in tl.get("tracks", []):
         tr2 = dict(tr)
@@ -191,6 +194,11 @@ def _resolve_ffmpeg_bin() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def _sanitize_orientation(raw) -> str:
+    val = (raw or "").strip().lower()
+    return "portrait" if val == "portrait" else "landscape"
+
+
 # --------------------------- VIDEO endpoints ---------------------------
 
 class PreviewRenderView(APIView):
@@ -202,9 +210,15 @@ class PreviewRenderView(APIView):
             return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
         data = ser.validated_data
 
+        # orientation: read from raw request OR validated data; default landscape
+        orientation = _sanitize_orientation(
+            getattr(request, "data", {}).get("orientation") or data.get("orientation")
+        )
+
         # localize
         try:
             data_local = _localize_timeline_assets(request, data)
+            data_local["orientation"] = orientation
         except Exception as e:
             return Response({"error": f"Failed to localize assets: {e}"}, status=400)
 
@@ -247,8 +261,13 @@ class RenderSaveView(APIView):
         data = ser.validated_data
         name = (data.get("name") or "").strip() or f"Untitled {now().strftime('%Y-%m-%d %H:%M:%S')}"
 
+        orientation = _sanitize_orientation(
+            getattr(request, "data", {}).get("orientation") or data.get("orientation")
+        )
+
         try:
             data_local = _localize_timeline_assets(request, data)
+            data_local["orientation"] = orientation
         except Exception as e:
             return Response({"error": f"Failed to localize assets: {e}"}, status=400)
 
@@ -263,6 +282,7 @@ class RenderSaveView(APIView):
             type="video",
             duration_seconds=int(max(1, round(duration))),
             status="locked",
+            orientation=orientation,
         )
 
         out_dir = _ensure_dir_inside_media("locked")
@@ -304,6 +324,7 @@ class RenderSaveView(APIView):
             "created_at": lc.created_at,
             "file": lc.file.name,
             "file_url": _media_url_for(request, output_rel),
+            "orientation": lc.orientation,
         }, status=200)
 
 
@@ -318,8 +339,13 @@ class ImagePreviewView(APIView):
             return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
         data = ser.validated_data
 
+        orientation = _sanitize_orientation(
+            getattr(request, "data", {}).get("orientation") or data.get("orientation")
+        )
+
         try:
             data_local = _localize_timeline_assets(request, data)
+            data_local["orientation"] = orientation
         except Exception as e:
             return Response({"error": f"Failed to localize assets: {e}"}, status=400)
 
@@ -360,9 +386,13 @@ class ImageSaveView(APIView):
         data = ser.validated_data
 
         name = (data.get("name") or "").strip() or f"Untitled {now().strftime('%Y-%m-%d %H:%M:%S')}"
+        orientation = _sanitize_orientation(
+            getattr(request, "data", {}).get("orientation") or data.get("orientation")
+        )
 
         try:
             data_local = _localize_timeline_assets(request, data)
+            data_local["orientation"] = orientation
         except Exception as e:
             return Response({"error": f"Failed to localize assets: {e}"}, status=400)
 
@@ -372,6 +402,7 @@ class ImageSaveView(APIView):
             type="image",
             duration_seconds=0,
             status="locked",
+            orientation=orientation,
         )
 
         out_dir = _ensure_dir_inside_media("locked")
@@ -412,14 +443,25 @@ class ImageSaveView(APIView):
             "created_at": lc.created_at,
             "file": lc.file.name,
             "file_url": _media_url_for(request, output_rel),
+            "orientation": lc.orientation,
         }, status=200)
 
 
 class LockedListView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
+    def get(self, request, orientation: str | None = None):
+        # orientation from path (if supplied) OR query param (?orientation=portrait)
+        q_orient = orientation or request.query_params.get("orientation")
+        if q_orient:
+            q_orient = q_orient.strip().lower()
+            if q_orient not in ("portrait", "landscape"):
+                q_orient = None
+
         qs = LockedContent.objects.filter(user=request.user).order_by("-created_at")
+        if q_orient:
+            qs = qs.filter(orientation=q_orient)
+
         out = []
         media_url = getattr(settings, "MEDIA_URL", "/media/")
         if not media_url.endswith("/"):
@@ -436,5 +478,6 @@ class LockedListView(APIView):
                 "created_at": it.created_at,
                 "file": it.file.name if it.file else None,
                 "file_url": (request.build_absolute_uri(media_url + rel) if rel else None),
+                "orientation": it.orientation,
             })
         return Response(out, status=200)

@@ -16,5 +16,5 @@ urlpatterns = [
     path("render", RenderSaveView.as_view(), name="render-save"),                       # video
     path("render/image/preview", ImagePreviewView.as_view(), name="render-image-preview"),
     path("render/image", ImageSaveView.as_view(), name="render-image"),
-    path("locked/list", LockedListView.as_view(), name="locked-list"),
+    path("locked/list/<str:orientation>", LockedListView.as_view(), name="locked-list-by-orientation"),
 ]
