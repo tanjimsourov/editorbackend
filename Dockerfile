@@ -1,5 +1,6 @@
 # Dockerfile
-FROM python:3.12-slim AS base
+# Use Debian 12 (bookworm) so Microsoft ODBC Driver 18 packages install cleanly.
+FROM python:3.12-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -15,12 +16,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# ---------- System deps (Debian trixie) ----------
-# - ffmpeg for your trims/encodes
-# - fonts: use Noto/Unifont (broad script + emoji). Avoid fonts-ubuntu (not in trixie).
-# - Chromium runtime libs for Playwright's bundled Chromium
-# - poppler-utils optional (PDF rasterization)
-# - unixodbc libs optional (safe even if ODBC block disabled)
+# ---------- System deps (Debian bookworm) ----------
+# - ffmpeg for trims/encodes
+# - fonts: Noto + Unifont (broad script + emoji)
+# - Chromium runtime libs for Playwright
+# - poppler-utils optional (PDF raster)
+# - unixODBC + dev headers for pyodbc
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       ffmpeg \
@@ -35,19 +36,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgtk-3-0 \
   && rm -rf /var/lib/apt/lists/*
 
-# ---------- (Optional) Microsoft ODBC Driver 18 ----------
-# Disabled by default to guarantee clean builds on trixie.
-# Enable with: --build-arg INSTALL_MSODBCSQL18=1
-ARG INSTALL_MSODBCSQL18=0
-RUN if [ "$INSTALL_MSODBCSQL18" = "1" ]; then \
-      curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
-      echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
-        > /etc/apt/sources.list.d/microsoft-prod.list && \
-      apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 && \
-      rm -rf /var/lib/apt/lists/* ; \
-    fi
+# ---------- Microsoft ODBC Driver 18 for SQL Server ----------
+# Official MS repo for Debian 12 (bookworm)
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+      | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+      > /etc/apt/sources.list.d/microsoft-prod.list && \
+    apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 && \
+    rm -rf /var/lib/apt/lists/*
 
-# Safety net for libodbc soname (no-op if already present)
+# Safety net for libodbc soname (usually not needed, harmless if present)
 RUN test -e /usr/lib/x86_64-linux-gnu/libodbc.so.2 || \
     ln -s /usr/lib/x86_64-linux-gnu/libodbc.so /usr/lib/x86_64-linux-gnu/libodbc.so.2 || true
 
@@ -62,7 +60,7 @@ RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir playwright==1.47.0 gunicorn
 
 # ---------- Bake Playwright browsers (Chromium) ----------
-# IMPORTANT: do NOT use --with-deps on Debian trixie (Ubuntu-only script).
+# IMPORTANT: do NOT use --with-deps (Ubuntu-only installer scripts).
 RUN python -m playwright install chromium
 
 # ---------- App code ----------
@@ -76,21 +74,14 @@ USER appuser
 
 EXPOSE 8003
 
-# ---------- (Optional) Healthcheck ----------
-# Adjust path if your Django has a health endpoint; else comment these two lines.
-# HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-#   CMD python - <<'PY' || exit 1
-# import urllib.request, os
-# url = f"http://127.0.0.1:8003/healthz"
-# urllib.request.urlopen(url, timeout=3)
-# PY
-
-# ---------- CMD (JSON form; safe signal handling) ----------
+# ---------- CMD (JSON form; resilient startup) ----------
+# - makemigrations: best-effort (won't crash container if DB temporarily unavailable)
+# - migrate: best-effort as well; logs warning if it fails so app can still boot
 CMD ["bash","-lc","\
   echo 'FFMPEG_BIN='${FFMPEG_BIN} && ffmpeg -hide_banner -version && \
   echo 'Ensuring MEDIA_ROOT at: '${MEDIA_ROOT} && mkdir -p \"${MEDIA_ROOT}\" && \
-  python manage.py makemigrations --noinput || true && \
-  python manage.py migrate --noinput && \
-  (python manage.py collectstatic --noinput || true) && \
+  (python manage.py makemigrations --noinput || echo '[WARN] makemigrations failed (continuing)') && \
+  (python manage.py migrate --noinput || echo '[WARN] migrate failed (continuing)') && \
+  (python manage.py collectstatic --noinput || echo '[WARN] collectstatic failed (continuing)') && \
   gunicorn editorBackend.wsgi:application --bind 0.0.0.0:8003 --workers 3 --timeout 120 \
 "]
