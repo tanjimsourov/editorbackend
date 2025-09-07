@@ -4,21 +4,21 @@ FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    # Playwright: put browser binaries in a fixed path (not per-user cache)
+    # Put Playwright browsers in a fixed, shared path (not per-user cache)
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 
 # ---------- System deps ----------
-# ffmpeg: your video trims
-# fonts: for drawtext/emoji; fontconfig helps ffmpeg find fonts
-# chromium deps: needed for Playwright's bundled Chromium to run
+# ffmpeg: video trim/encode
+# fonts: drawtext & emoji; include Debian names for Ubuntu-equivalents
+# chromium deps: runtime libs needed by Playwright's Chromium
 # poppler-utils: optional (PDF raster)
 # curl/gnupg/ca-certs: for optional MS ODBC repo
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       ffmpeg \
-      fontconfig fonts-dejavu \
+      fontconfig fonts-dejavu fonts-unifont fonts-ubuntu \
       poppler-utils \
       curl gnupg ca-certificates apt-transport-https \
       unixodbc unixodbc-dev \
@@ -59,36 +59,31 @@ RUN ffmpeg -hide_banner -version && which ffmpeg
 COPY requirements.txt /app/
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    # Ensure Playwright (Python) is present even if not in requirements.txt
+    # Ensure Playwright (Python) is installed even if not in requirements.txt
     pip install --no-cache-dir playwright==1.47.0 && \
     pip install --no-cache-dir gunicorn
 
 # ---------- Download Playwright browsers at build time ----------
-# This bakes Chromium into the image, avoiding runtime install errors.
-# --with-deps ensures missing shared libs are pulled if needed.
-RUN python -m playwright install --with-deps chromium
+# IMPORTANT: drop "--with-deps" (it uses an Ubuntu script that breaks on Debian).
+RUN python -m playwright install chromium
 
 # ---------- App code ----------
 COPY . /app/
 
-# ---------- Create non-root user & permissions ----------
+# ---------- Non-root user & permissions ----------
 RUN useradd -m appuser && \
     mkdir -p /app/media /ms-playwright && \
     chown -R appuser:appuser /app /ms-playwright
 USER appuser
 
-# Expose the port your Gunicorn will bind to
 EXPOSE 8003
 
-# ---------- Entrypoint / CMD ----------
-# - Ensure MEDIA_ROOT exists
-# - Safe migrations
-# - Safe collectstatic
-# - Start gunicorn
-CMD bash -lc "\
+# ---------- CMD (JSON form) ----------
+CMD ["bash","-lc","\
   echo 'FFMPEG_BIN='${FFMPEG_BIN} && ffmpeg -hide_banner -version && \
   echo 'Ensuring MEDIA_ROOT at: '${MEDIA_ROOT} && mkdir -p \"${MEDIA_ROOT}\" && \
   python manage.py makemigrations --noinput || true && \
   python manage.py migrate --noinput && \
   (python manage.py collectstatic --noinput || true) && \
-  gunicorn editorBackend.wsgi:application --bind 0.0.0.0:8003 --workers 3 --timeout 120"
+  gunicorn editorBackend.wsgi:application --bind 0.0.0.0:8003 --workers 3 --timeout 120 \
+"]
