@@ -25,7 +25,6 @@ class BaseTrackSerializer(serializers.Serializer):
     enable = serializers.BooleanField(required=False)
 
     def validate(self, data):
-        # generic per-track sanity checks
         if data["end"] < data["start"]:
             raise serializers.ValidationError("Track end must be >= start.")
         return data
@@ -87,7 +86,7 @@ class AudioTrackSerializer(BaseTrackSerializer):
     srcOut = serializers.FloatField(required=False, min_value=0)
 
 
-# Circle track (vector)
+# Circle
 class CircleTrackSerializer(serializers.Serializer):
     id = serializers.CharField()
     type = serializers.ChoiceField(choices=["circle"])
@@ -109,7 +108,7 @@ class CircleTrackSerializer(serializers.Serializer):
         return data
 
 
-# Triangle track (vector)
+# Triangle
 class TriangleTrackSerializer(serializers.Serializer):
     id = serializers.CharField()
     type = serializers.ChoiceField(choices=["triangle"])
@@ -135,7 +134,7 @@ class TriangleTrackSerializer(serializers.Serializer):
         return data
 
 
-# Rectangle track (vector)
+# Rectangle
 class RectangleTrackSerializer(serializers.Serializer):
     id = serializers.CharField()
     type = serializers.ChoiceField(choices=["rectangle"])
@@ -143,15 +142,13 @@ class RectangleTrackSerializer(serializers.Serializer):
     end = serializers.FloatField(min_value=0)
     z = serializers.IntegerField()
 
-    # top-left corner and size
     x = serializers.FloatField()
     y = serializers.FloatField()
     width = serializers.FloatField(min_value=1)
     height = serializers.FloatField(min_value=1)
 
-    # styling
     fill = serializers.CharField(required=False, allow_blank=True, allow_null=True)
-    color = serializers.CharField(required=False, allow_blank=True, allow_null=True)  # fallback if `fill` missing
+    color = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     outline = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     outlineWidth = serializers.FloatField(required=False, default=0)
     opacity = serializers.FloatField(required=False, min_value=0.0, max_value=1.0, default=1.0)
@@ -163,7 +160,7 @@ class RectangleTrackSerializer(serializers.Serializer):
         return data
 
 
-# Line track (vector)
+# Line
 class LineTrackSerializer(serializers.Serializer):
     id = serializers.CharField()
     type = serializers.ChoiceField(choices=["line"])
@@ -171,11 +168,10 @@ class LineTrackSerializer(serializers.Serializer):
     end = serializers.FloatField(min_value=0)
     z = serializers.IntegerField()
 
-    # start point (anchor), geometry, style
     x = serializers.FloatField()
     y = serializers.FloatField()
     length = serializers.FloatField(min_value=1)
-    rotation = serializers.FloatField()  # degrees
+    rotation = serializers.FloatField()
     color = serializers.CharField()
     thickness = serializers.FloatField(min_value=1)
     opacity = serializers.FloatField(required=False, min_value=0.0, max_value=1.0, default=1.0)
@@ -186,7 +182,7 @@ class LineTrackSerializer(serializers.Serializer):
         return data
 
 
-# Ellipse track (vector)
+# Ellipse
 class EllipseTrackSerializer(serializers.Serializer):
     id = serializers.CharField()
     type = serializers.ChoiceField(choices=["ellipse"])
@@ -194,15 +190,13 @@ class EllipseTrackSerializer(serializers.Serializer):
     end = serializers.FloatField(min_value=0)
     z = serializers.IntegerField()
 
-    # top-left corner of bbox & size
     x = serializers.FloatField()
     y = serializers.FloatField()
     width = serializers.FloatField(min_value=1)
     height = serializers.FloatField(min_value=1)
 
-    # styling
     fill = serializers.CharField(required=False, allow_blank=True, allow_null=True)
-    color = serializers.CharField(required=False, allow_blank=True, allow_null=True)  # fallback
+    color = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     outline = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     outlineWidth = serializers.FloatField(required=False, default=0)
     opacity = serializers.FloatField(required=False, min_value=0.0, max_value=1.0, default=1.0)
@@ -213,7 +207,7 @@ class EllipseTrackSerializer(serializers.Serializer):
         return data
 
 
-# Sign track (composite vector panel)
+# Sign (composite vector) – unchanged
 class _ShowComponentsSerializer(serializers.Serializer):
     text = serializers.BooleanField(required=False, default=False)
     icon = serializers.BooleanField(required=False, default=False)
@@ -272,7 +266,6 @@ class SignTrackSerializer(serializers.Serializer):
     fontSizes = _FontSizesSerializer(required=False)
 
     iconSize = serializers.IntegerField(required=False, min_value=1)
-
     image = _ImageSettingsSerializer(required=False)
 
     def validate(self, data):
@@ -281,7 +274,8 @@ class SignTrackSerializer(serializers.Serializer):
         return data
 
 
-# Weather track
+# -------- Weather track --------
+
 class _WxShowComponentsSerializer(serializers.Serializer):
     summary = serializers.BooleanField(required=False, default=False)
     temperature = serializers.BooleanField(required=False, default=False)
@@ -294,6 +288,7 @@ class _WxShowComponentsSerializer(serializers.Serializer):
     date = serializers.BooleanField(required=False, default=False)
     attribution = serializers.BooleanField(required=False, default=False)
     image = serializers.BooleanField(required=False, default=False)
+    location = serializers.BooleanField(required=False, default=True)  # allow toggle
 
 
 class _WxColorsSerializer(serializers.Serializer):
@@ -344,6 +339,19 @@ class _WxLayoutItemSerializer(serializers.Serializer):
     height = serializers.FloatField(min_value=1)
 
 
+class _WxDataSerializer(serializers.Serializer):
+    summary = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    icon = serializers.CharField(required=False, allow_blank=True, allow_null=True)  # e.g., "01d"
+    temperature = serializers.FloatField(required=False)
+    maxTemp = serializers.FloatField(required=False)
+    minTemp = serializers.FloatField(required=False)
+    humidity = serializers.FloatField(required=False)
+    windSpeed = serializers.FloatField(required=False)
+    windDirection = serializers.CharField(required=False, allow_blank=True, allow_null=True)  # deg or text
+    dateText = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    attributionText = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
 class WeatherTrackSerializer(serializers.Serializer):
     id = serializers.CharField()
     type = serializers.ChoiceField(choices=["weather"])
@@ -373,6 +381,7 @@ class WeatherTrackSerializer(serializers.Serializer):
     name = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     layout = serializers.DictField(child=_WxLayoutItemSerializer(), required=False)
+    data = _WxDataSerializer(required=False)  # 👈 NOW ACCEPTED
 
     def validate(self, data):
         if data["end"] < data["start"]:
@@ -381,7 +390,6 @@ class WeatherTrackSerializer(serializers.Serializer):
 
 
 class TimelineSerializer(serializers.Serializer):
-    # ✅ allow still-image renders
     duration = serializers.FloatField(min_value=0.0, required=False, default=0.0)
     width = serializers.IntegerField(min_value=16)
     height = serializers.IntegerField(min_value=16)
@@ -398,7 +406,6 @@ class TimelineSerializer(serializers.Serializer):
     meta = serializers.DictField(required=False)
 
     def validate(self, data):
-        # Validate & coerce each track to its typed serializer
         typed_tracks = []
         for tr in data.get("tracks", []):
             t = tr.get("type")
@@ -434,14 +441,12 @@ class TimelineSerializer(serializers.Serializer):
 
         data["tracks"] = typed_tracks
 
-        # If duration > 0, soft-check that tracks live within [0, duration]
         dur = float(data.get("duration") or 0.0)
         if dur > 0:
             for tr in typed_tracks:
                 if tr["start"] < 0 or tr["end"] < 0:
                     raise serializers.ValidationError("Track times must be non-negative.")
                 if tr["start"] > dur or tr["end"] > dur:
-                    # Not fatal for generation, but catch early if user expects strict clip window
                     raise serializers.ValidationError(
                         f"Track '{tr.get('id','')}' exceeds timeline duration ({dur}s)."
                     )

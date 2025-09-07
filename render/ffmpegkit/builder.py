@@ -22,6 +22,7 @@ Mode = Literal["preview", "final"]
 # Preview downscale cap (speed boost). Set to None to disable.
 PREVIEW_MAX_DIM = (1280, 720)  # (W, H)
 
+
 def _input_has_audio(src: str) -> bool:
     try:
         out = subprocess.check_output(
@@ -42,13 +43,13 @@ def _input_has_audio(src: str) -> bool:
 
 
 def _build_filtergraph_and_inputs(tl: dict, positive_duration: float) -> Tuple[
-    str,               # filter_complex
-    str,               # last_v label
-    List[List[str]],   # input flags per input
-    List[str],         # input srcs
-    List[str],         # audio labels (may be empty)
-    int,               # FPS
-    int, int,          # W, H (output canvas before optional preview downscale)
+    str,  # filter_complex
+    str,  # last_v label
+    List[List[str]],  # input flags per input
+    List[str],  # input srcs
+    List[str],  # audio labels (may be empty)
+    int,  # FPS
+    int, int,  # W, H (output canvas before optional preview downscale)
 ]:
     W, H = int(tl["width"]), int(tl["height"])
     FPS = int(tl.get("fps", 30))

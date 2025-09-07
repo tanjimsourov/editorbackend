@@ -1,3 +1,4 @@
+# views/screenshot_api.py
 from urllib.parse import urlparse
 import ipaddress
 import os
@@ -5,10 +6,14 @@ import uuid
 import shutil
 import subprocess
 import re
+import io
+import time
+import base64
+import imghdr
 from pathlib import Path
 
 from django.conf import settings
-from django.http import HttpResponse, FileResponse
+from django.http import HttpResponse, FileResponse, JsonResponse
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
@@ -75,8 +80,8 @@ def _detect_leading_black(in_path: str) -> float:
     try:
         # We limit to first ~8 seconds for speed
         # blackdetect params:
-        #   d=0.10  -> minimal duration for a black segment
-        #   pic_th=0.98 -> how close to black/white to consider (more strict)
+        #   d=0.10     -> minimal duration for a black segment
+        #   pic_th=0.98 -> how close to black/white to consider (strict)
         # We output to null and parse stderr.
         cmd = [
             ffmpeg,
@@ -96,20 +101,67 @@ def _detect_leading_black(in_path: str) -> float:
             check=False,
         )
         stderr = proc.stderr or ""
-        # Look for the very first black segment near the beginning, and get its black_end
-        # Example lines:
+        # Example:
         # [blackdetect @ ...] black_start:0 black_end:1.92 black_duration:1.92
         first_match = re.search(r"black_start:\s*([0-9.]+)\s+black_end:\s*([0-9.]+)", stderr)
         if not first_match:
             return 0.0
         black_start = float(first_match.group(1))
         black_end = float(first_match.group(2))
-        # Only count it if it starts near 0 (lead-in)
         if black_start <= 0.25:
             return max(0.0, black_end)
         return 0.0
     except Exception:
         return 0.0
+
+
+# ---------- helpers for screenshot persistence ----------
+def _save_bytes_to_media(data: bytes, subdir: str = "images", filename: str | None = None) -> str:
+    """
+    Save raw bytes under MEDIA_ROOT/<subdir>/..., return PUBLIC relative url: /media/<subdir>/<name.ext>
+    """
+    os.makedirs(os.path.join(settings.MEDIA_ROOT, subdir), exist_ok=True)
+    ext = ".png"
+    kind = imghdr.what(None, h=data)
+    if kind == "jpeg":
+        ext = ".jpg"
+    elif kind:
+        ext = f".{kind}"
+    name = filename or (uuid.uuid4().hex + ext)
+    rel_path = f"{subdir}/{name}"
+    from django.core.files.base import ContentFile
+    from django.core.files.storage import default_storage
+    default_storage.save(rel_path, ContentFile(data))
+    return f"{(settings.MEDIA_URL or '/media/').rstrip('/')}/{rel_path}"
+
+
+def _guess_name_from_url(u: str) -> str:
+    try:
+        return urlparse(u).netloc or "webpage"
+    except Exception:
+        return "webpage"
+
+
+def _probe_png_wh(data: bytes) -> tuple[int | None, int | None]:
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        return im.width, im.height
+    except Exception:
+        return None, None
+
+
+def _viewport_for_orientation(orientation: str) -> tuple[int, int]:
+    """
+    Returns (width, height) for the requested orientation.
+    Landscape: 1920x1080
+    Portrait:  1080x1920
+    """
+    o = (orientation or "landscape").strip().lower()
+    if o == "portrait":
+        return 1080, 1920
+    # default / fallback
+    return 1920, 1080
 
 
 # ---------- Screenshot helper ----------
@@ -155,7 +207,7 @@ def _trim_and_convert_with_ffmpeg(
 ) -> str:
     """
     Trim leading 'start_sec' seconds and (optionally) convert container/codec.
-    We do accurate seek by putting -ss AFTER -i (re-encode).
+    Accurate seek by putting -ss AFTER -i (re-encode).
     Returns output file path. If ffmpeg is missing or fails, returns input path.
     """
     if not _ffmpeg_exists():
@@ -167,7 +219,6 @@ def _trim_and_convert_with_ffmpeg(
     out_basename = f"{uuid.uuid4().hex}.{fmt}"
     out_path = os.path.join(out_dir, out_basename)
 
-    # Accurate trim: -ss AFTER -i for re-encode seeking.
     if fmt == "mp4":
         cmd = [
             ffmpeg, "-hide_banner", "-y",
@@ -189,7 +240,6 @@ def _trim_and_convert_with_ffmpeg(
             out_path,
         ]
     else:
-        # Unknown format; default to mp4
         fmt = "mp4"
         out_path = os.path.join(out_dir, f"{uuid.uuid4().hex}.mp4")
         cmd = [
@@ -211,7 +261,6 @@ def _trim_and_convert_with_ffmpeg(
             pass
         return out_path
     except Exception:
-        # On failure, keep the original
         return in_path
 
 
@@ -220,17 +269,15 @@ async def _capture_scroll_video(
     viewport_w: int = 1920,
     viewport_h: int = 1080,
     speed_pps: int = 180,     # pixels per second (reading speed)
-    padding_ms: int = 800,    # tail padding (end only) so last fold is readable
+    padding_ms: int = 800,    # tail padding (end only)
     timeout_ms: int = 30000,
     out_format: str = "mp4",
 ) -> str:
     """
-    Opens the URL at 1920x1080, records while auto-scrolling, then trims the
-    video head to the page's First Contentful Paint (FCP) and any detected
-    leading black/blank, so it starts on content.
+    Opens the URL at viewport_w x viewport_h, records while auto-scrolling,
+    then trims the video head to the page's FCP and any detected leading blank frames.
     Returns absolute filesystem path to the final video.
     """
-    # Temp dir where Playwright writes videos (it requires a directory)
     tmp_root = Path(settings.MEDIA_ROOT) / "tmp_playwright_videos"
     tmp_root.mkdir(parents=True, exist_ok=True)
 
@@ -248,10 +295,8 @@ async def _capture_scroll_video(
         page = await context.new_page()
 
         try:
-            # Navigate; recording starts before this, but we will trim later.
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            # Wait for visible content (text or media) to be on screen
             await page.wait_for_function(
                 """
                 () => {
@@ -267,7 +312,6 @@ async def _capture_scroll_video(
                 timeout=timeout_ms,
             )
 
-            # Grab First Contentful Paint (ms relative to navigationStart)
             fcp_ms = await page.evaluate(
                 """
                 () => {
@@ -278,10 +322,8 @@ async def _capture_scroll_video(
                 """
             ) or 0
 
-            # Two RAF ticks to ensure first painted frame is stable
             await page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
 
-            # Measure document height & compute scrolling plan
             metrics = await page.evaluate(
                 """() => {
                     const body = document.body;
@@ -297,14 +339,13 @@ async def _capture_scroll_video(
             scroll_height = int(metrics["scrollHeight"])
             viewport_h_now = int(metrics["viewportH"])
 
-            # Start at top (after content is ready)
             await page.evaluate("window.scrollTo(0, 0)")
 
             if scroll_height <= viewport_h_now:
-                await page.wait_for_timeout(600)  # brief steady capture when no scroll is needed
+                await page.wait_for_timeout(600)
             else:
                 distance = scroll_height - viewport_h_now
-                step_px = 40  # small smooth steps
+                step_px = 40
                 ms_per_step = int((step_px / max(1, speed_pps)) * 1000)
 
                 scrolled = 0
@@ -313,11 +354,9 @@ async def _capture_scroll_video(
                     await page.evaluate("(y) => window.scrollTo(0, y)", scrolled)
                     await page.wait_for_timeout(ms_per_step)
 
-                # Ensure we’ve reached the bottom and let the viewer read the last fold
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(max(800, padding_ms))
 
-            # Finalize recording. (Video file is resolved once the page is closed)
             video_obj = page.video
             await page.close()
             video_tmp_path = await video_obj.path()
@@ -326,27 +365,20 @@ async def _capture_scroll_video(
             await context.close()
             await browser.close()
 
-    # Move raw webm to MEDIA_ROOT/webpage_videos/<uuid>.webm
     out_dir = Path(settings.MEDIA_ROOT) / "webpage_videos"
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_webm_path = out_dir / f"{uuid.uuid4().hex}.webm"
     os.replace(video_tmp_path, raw_webm_path)
 
-    # Compute trim seconds:
-    # 1) FCP in seconds, shave a tiny 50ms pre-roll
     fcp_sec = max(0.0, float((fcp_ms or 0)) / 1000.0 - 0.05)
-    # 2) Detect black/blank lead
     black_lead_sec = _detect_leading_black(str(raw_webm_path))
-    # Final start = the later of the two (plus a tiny safety 30ms)
     start_sec = max(fcp_sec, black_lead_sec) + 0.03
 
-    # Convert/trim to requested format (default mp4) using accurate seek
     final_path = _trim_and_convert_with_ffmpeg(str(raw_webm_path), start_sec, out_format)
-
     return final_path
 
 
-@method_decorator(csrf_exempt, name="dispatch")  # remove if you handle CSRF tokens
+@method_decorator(csrf_exempt, name="dispatch")
 class ScreenshotAPIView(APIView):
     authentication_classes = []
     """
@@ -358,9 +390,13 @@ class ScreenshotAPIView(APIView):
       - timeout_ms (int, default=30000)
 
       - speed_pps (int, default=180)         [video]
-      - padding_ms (int, default=800)        [video] end padding only
-      - format: "mp4" | "webm" (default "mp4")
+      - padding_ms (int, default=800)        [video]
+      - format: "mp4" | "webm"               [video] default "mp4"
       - download (bool, default=false)       [video] stream file inline if true
+
+      - persist (bool, default=false)        [screenshot] save into /media/images and return asset JSON
+
+      - orientation: "landscape" | "portrait" (default "landscape")  [screenshot & video]
     """
 
     def get(self, request, *args, **kwargs):
@@ -377,6 +413,12 @@ class ScreenshotAPIView(APIView):
         if not _is_public_http_url(url):
             return Response({"error": "Only public http(s) URLs are allowed."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Orientation handling
+        orientation = (request.query_params.get("orientation") or request.data.get("orientation") or "landscape").lower()
+        if orientation not in {"landscape", "portrait"}:
+            orientation = "landscape"
+        viewport_w, viewport_h = _viewport_for_orientation(orientation)
+
         timeout_ms = request.query_params.get("timeout_ms") or request.data.get("timeout_ms", 30000)
 
         # VIDEO params
@@ -385,9 +427,10 @@ class ScreenshotAPIView(APIView):
         download = str(request.query_params.get("download") or request.data.get("download") or "false").lower() == "true"
         out_format = (request.query_params.get("format") or request.data.get("format") or "mp4").lower()
 
-        # SCREENSHOT params (backward compatibility)
+        # SCREENSHOT params
         device_scale = request.query_params.get("device_scale") or request.data.get("device_scale", 1.0)
         delay_ms = request.query_params.get("delay_ms") or request.data.get("delay_ms", 0)
+        persist = str(request.query_params.get("persist") or request.data.get("persist") or "false").lower() == "true"
 
         # Validate numerics
         try:
@@ -403,10 +446,10 @@ class ScreenshotAPIView(APIView):
             try:
                 video_fs_path = async_to_sync(_capture_scroll_video)(
                     url=url,
-                    viewport_w=1920,
-                    viewport_h=1080,
-                    speed_pps=max(60, speed_pps),     # enforce a sane lower bound
-                    padding_ms=max(200, padding_ms),  # end padding only
+                    viewport_w=viewport_w,
+                    viewport_h=viewport_h,
+                    speed_pps=max(60, speed_pps),
+                    padding_ms=max(200, padding_ms),
                     timeout_ms=timeout_ms,
                     out_format=out_format,
                 )
@@ -429,9 +472,10 @@ class ScreenshotAPIView(APIView):
                 {
                     "url": public_url,
                     "path": rel_path,
-                    "width": 1920,
-                    "height": 1080,
+                    "width": viewport_w,
+                    "height": viewport_h,
                     "format": out_format,
+                    "orientation": orientation,
                     "note": "Head trimmed to FCP and detected blank frames for zero white intro.",
                 },
                 status=status.HTTP_200_OK,
@@ -444,12 +488,35 @@ class ScreenshotAPIView(APIView):
                     device_scale_factor=device_scale,
                     delay_ms=delay_ms,
                     timeout_ms=timeout_ms,
+                    viewport_w=viewport_w,
+                    viewport_h=viewport_h,
+                    full_page=True,
                 )
             except PWTimeoutError:
                 return Response({"error": "Page load timed out."}, status=status.HTTP_504_GATEWAY_TIMEOUT)
             except Exception as e:
                 return Response({"error": f"Failed to capture screenshot: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+            if persist:
+                rel_url = _save_bytes_to_media(png, subdir="images", filename=None)
+                file_url = request.build_absolute_uri(rel_url)
+                w, h = _probe_png_wh(png)
+                name = _guess_name_from_url(url)
+
+                # If you have an Images DB model, create the record here and return the real PK.
+                asset = {
+                    "id": int(time.time()),
+                    "name": name,
+                    "url": rel_url,       # relative /media/...
+                    "file_url": file_url, # absolute
+                    "width": w,
+                    "height": h,
+                    "orientation": orientation,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                return JsonResponse({"asset": asset, "persisted": True, "source_url": url}, status=200)
+
+            # Back-compat: stream image if not persisting
             resp = HttpResponse(png, content_type="image/png")
             resp["Content-Disposition"] = 'inline; filename="screenshot.png"'
             return resp
